@@ -10,7 +10,7 @@ from typing import Callable
 import torch
 import torch.distributed as dist
 
-GK, GN, AN = 8192, 18432, 10240
+DEFAULT_GK, DEFAULT_GN, DEFAULT_AN = 8192, 18432, 10240
 OK, ON = 8192, 8192
 
 
@@ -48,14 +48,14 @@ def _bench_segments(segments: list[tuple[str, Callable[[], None]]], *, warmup: i
 
 
 def _bench_gemm_a2a(args, rank: int, world: int) -> None:
-    n_shard = AN // world
+    n_shard = args.an // world
     torch.manual_seed(0xA2A + rank)
-    w = torch.randn(GN, GK, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(args.gn, args.gk, dtype=torch.bfloat16, device="cuda")
     if rank == 0:
-        print(f"\n=== GEMM+A2A split: K={GK} N={GN} a2a_N={AN} world={world} ===")
+        print(f"\n=== GEMM+A2A split: K={args.gk} N={args.gn} a2a_N={args.an} world={world} ===")
     for m in _parse_csv_ints(args.shapes):
-        x = torch.randn(m, GK, dtype=torch.bfloat16, device="cuda")
-        out = torch.empty(m, GN, dtype=torch.bfloat16, device="cuda")
+        x = torch.randn(m, args.gk, dtype=torch.bfloat16, device="cuda")
+        out = torch.empty(m, args.gn, dtype=torch.bfloat16, device="cuda")
         src = torch.empty(world * m, n_shard, dtype=torch.bfloat16, device="cuda")
         dst = torch.empty_like(src)
         cols_holder: list[torch.Tensor] = [torch.empty(world, m, n_shard, dtype=torch.bfloat16, device="cuda")]
@@ -64,7 +64,7 @@ def _bench_gemm_a2a(args, rank: int, world: int) -> None:
             torch.matmul(x, w.t(), out=out)
 
         def pack_contiguous() -> None:
-            cols_holder[0] = out[:, :AN].view(m, world, n_shard).transpose(0, 1).contiguous()
+            cols_holder[0] = out[:, :args.an].view(m, world, n_shard).transpose(0, 1).contiguous()
 
         def copy_src() -> None:
             src.copy_(cols_holder[0].view(world * m, n_shard))
@@ -133,6 +133,9 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--side", choices=["gemm_a2a", "a2a_gemm", "all"], default="all")
     parser.add_argument("--shapes", default="2048")
+    parser.add_argument("--gk", type=int, default=DEFAULT_GK)
+    parser.add_argument("--gn", type=int, default=DEFAULT_GN)
+    parser.add_argument("--an", type=int, default=DEFAULT_AN)
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--iters", type=int, default=10)
     args = parser.parse_args()

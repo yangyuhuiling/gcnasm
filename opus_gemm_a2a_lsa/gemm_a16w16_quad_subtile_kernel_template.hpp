@@ -12,6 +12,10 @@
 #define OPUS_STORE_PIPELINE 2
 #endif
 
+#ifndef OPUS_C_STORE_MODE
+#define OPUS_C_STORE_MODE 0
+#endif
+
 namespace gemm_quad_subtile {
 
 using opus::operator""_I;
@@ -360,7 +364,7 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
         return half_tile_n * T::HALF_B_N * kargs.stride_b + tile_k * T::B_K;
     };
 
-    auto u_gc = make_layout_gc<T>(lane_id, wave_id_m, wave_id_n, eff_stride_c);
+    [[maybe_unused]] auto u_gc = make_layout_gc<T>(lane_id, wave_id_m, wave_id_n, eff_stride_c);
     auto c_offset = [&](int half_tile_m, int half_tile_n) {
         return half_tile_m * T::HALF_B_M * eff_stride_c + half_tile_n * T::HALF_B_N + (col - eff_col_bias);
     };
@@ -379,7 +383,55 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
             p[1] = r1[0]; p[3] = r1[1];
         });
 
+#if OPUS_C_STORE_MODE == 1
+        // Reuse A LDS after compute is complete: first materialize the current
+        // 128x128 half-tile in row-major LDS, then have consecutive threads
+        // write consecutive vec8 chunks to global memory.
+        smem<D_C> s_c = make_smem(reinterpret_cast<D_C*>(smem_a + 2 * smem_a_byte));
+        auto u_sc = make_layout_gc<T>(lane_id, wave_id_m, wave_id_n, T::HALF_B_N);
+        store<T::VEC_C>(s_c, v_c_f16, u_sc);
+        s_waitcnt_lgkmcnt(0_I);
+        __builtin_amdgcn_s_barrier();
+
+        constexpr int vectors_per_half_tile = T::HALF_B_M * T::HALF_B_N / T::VEC_C;
+        constexpr int vectors_per_thread = vectors_per_half_tile / T::BLOCK_SIZE;
+        static_assert(vectors_per_half_tile % T::BLOCK_SIZE == 0);
+        static_for<vectors_per_thread>([&](auto i) {
+            const int linear_vec = opus::thread_id_x() + i.value * T::BLOCK_SIZE;
+            auto v = load<T::VEC_C>(s_c, linear_vec * T::VEC_C);
+            s_waitcnt_lgkmcnt(0_I);
+            const int row_in_half = linear_vec / (T::HALF_B_N / T::VEC_C);
+            const int col_vec = linear_vec - row_in_half * (T::HALF_B_N / T::VEC_C);
+            store<T::VEC_C>(g_c, v, c_offset(half_tile_m, half_tile_n) + row_in_half * eff_stride_c + col_vec * T::VEC_C);
+        });
+        __builtin_amdgcn_s_barrier();
+#elif OPUS_C_STORE_MODE == 2
+        // Wave-local gather: for each 32-row slice, lanes (0,1), (2,3), ...
+        // write adjacent vec8 chunks of the same row. The source data is pulled
+        // from the original MFMA/store layout with ds_bpermute.
+        static_for<num_chunks>([&](auto c) {
+            auto* p = p_u32 + c.value * u32_per_chunk;
+            const int lane = lane_id;
+            const int half_col_block = lane / 32;      // 0: cols 0..15, 1: cols 64..79 within this wave_n
+            const int lane_in_half = lane - half_col_block * 32;
+            const int row_in_16 = lane_in_half / 2;
+            const int vec_pair = lane_in_half - row_in_16 * 2;
+            const int src_lane = row_in_16 + half_col_block * 16 + vec_pair * 32;
+
+            i32x4_t raw;
+            raw[0] = __builtin_bit_cast(i32_t, shfl(p[0], src_lane));
+            raw[1] = __builtin_bit_cast(i32_t, shfl(p[1], src_lane));
+            raw[2] = __builtin_bit_cast(i32_t, shfl(p[2], src_lane));
+            raw[3] = __builtin_bit_cast(i32_t, shfl(p[3], src_lane));
+            auto v = __builtin_bit_cast(typename decltype(g_c)::template vector_type<T::VEC_C>, raw);
+
+            const int row_in_half = c.value * (T::T_M * T::W_M) + wave_id_m * T::W_M + row_in_16;
+            const int col_vec = half_col_block * 8 + wave_id_n * 2 + vec_pair;
+            store<T::VEC_C>(g_c, v, c_offset(half_tile_m, half_tile_n) + row_in_half * eff_stride_c + col_vec * T::VEC_C);
+        });
+#else
         store<T::VEC_C>(g_c, v_c_f16, u_gc, c_offset(half_tile_m, half_tile_n));
+#endif
     };
 
     const int loops = ceil_div(kargs.k, T::B_K);

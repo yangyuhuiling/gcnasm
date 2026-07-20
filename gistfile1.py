@@ -19,7 +19,7 @@ import torch.distributed as dist
 # Kernel dims (W = world size). GEMM+A2A: matmul [M,GK] x [GN,GK]^T, then scatter
 # the leading AN of GN output cols via one all_to_all. A2A+GEMM: all_to_all
 # gather [M*W, OK/W] -> [M, OK], then matmul [M,OK] x [ON,OK]^T -> [M, ON].
-GK, GN, AN = 8192, 18432, 10240
+DEFAULT_GK, DEFAULT_GN, DEFAULT_AN = 8192, 18432, 10240
 OK, ON = 8192, 8192
 def _parse_csv_ints(raw: str) -> list[int]:
     return [int(x) for x in raw.split(",") if x.strip()]
@@ -40,20 +40,20 @@ def _p50_ms(fn: Callable, *, warmup: int, iters: int) -> float:
     dist.all_reduce(t, op=dist.ReduceOp.MAX)
     return float(t.item())
 def _bench_gemm_a2a(args, rank: int, world: int) -> None:
-    n_shard = AN // world
+    n_shard = args.an // world
     torch.manual_seed(0xA2A + rank)
-    w = torch.randn(GN, GK, dtype=torch.bfloat16, device="cuda")
+    w = torch.randn(args.gn, args.gk, dtype=torch.bfloat16, device="cuda")
     if rank == 0:
-        print(f"\n=== GEMM+A2A: K={GK} N={GN} a2a_N={AN} world={world} ===")
+        print(f"\n=== GEMM+A2A: K={args.gk} N={args.gn} a2a_N={args.an} world={world} ===")
         print(f"{'M':>7}  {'p50 ms':>8}", flush=True)
     for m in _parse_csv_ints(args.shapes):
-        x = torch.randn(m, GK, dtype=torch.bfloat16, device="cuda")
-        out = torch.empty(m, GN, dtype=torch.bfloat16, device="cuda")
+        x = torch.randn(m, args.gk, dtype=torch.bfloat16, device="cuda")
+        out = torch.empty(m, args.gn, dtype=torch.bfloat16, device="cuda")
         src = torch.empty(world * m, n_shard, dtype=torch.bfloat16, device="cuda")
         dst = torch.empty_like(src)
         def baseline():
             torch.matmul(x, w.t(), out=out)
-            cols = out[:, :AN].view(m, world, n_shard).transpose(0, 1).contiguous()
+            cols = out[:, :args.an].view(m, world, n_shard).transpose(0, 1).contiguous()
             src.copy_(cols.view(world * m, n_shard))
             dist.all_to_all_single(dst, src)
         p50 = _p50_ms(baseline, warmup=args.warmup, iters=args.iters)
@@ -85,6 +85,9 @@ def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--side", choices=["gemm_a2a", "a2a_gemm", "all"], default="all")
     p.add_argument("--shapes", default="2048,4096")
+    p.add_argument("--gk", type=int, default=DEFAULT_GK)
+    p.add_argument("--gn", type=int, default=DEFAULT_GN)
+    p.add_argument("--an", type=int, default=DEFAULT_AN)
     p.add_argument("--warmup", type=int, default=10)
     p.add_argument("--iters", type=int, default=30)
     args = p.parse_args()
