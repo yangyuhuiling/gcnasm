@@ -237,14 +237,28 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
     using D_C = typename T::D_C;
     using D_ACC = typename T::D_ACC;
 
-    int wgid = (opus::block_id_y() * opus::grid_size_x()/opus::block_size_x()) + opus::block_id_x();
-    const int num_tiles_m = ceil_div(kargs.m, T::B_M);
-    int row = (wgid % num_tiles_m) * T::B_M;
-    int col = (wgid / num_tiles_m) * T::B_N;
-
-    int batch_id = opus::block_id_z();
     int wave_id = __builtin_amdgcn_readfirstlane(opus::thread_id_x() / get_warp_size());
     int lane_id = opus::thread_id_x() % get_warp_size();
+    const int num_tiles_m = ceil_div(kargs.m, T::B_M);
+    const int num_tiles_n = ceil_div(kargs.n, T::B_N);
+    const int tile_count = num_tiles_m * num_tiles_n;
+    const int total_tiles = tile_count * kargs.batch;
+    __shared__ unsigned int next_tile_id;
+
+    while (true) {
+        if (opus::thread_id_x() == 0) {
+            next_tile_id = __atomic_fetch_add(kargs.tile_counter, 1u, __ATOMIC_RELAXED);
+        }
+        __builtin_amdgcn_s_barrier();
+
+        const int tile_id = static_cast<int>(next_tile_id);
+        if (tile_id >= total_tiles) {
+            return;
+        }
+        const int batch_id = tile_id / tile_count;
+        const int tile_linear = tile_id - batch_id * tile_count;
+        int row = (tile_linear % num_tiles_m) * T::B_M;
+        int col = (tile_linear / num_tiles_m) * T::B_N;
 
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + batch_id * kargs.stride_a_batch + row * kargs.stride_a, (kargs.m - row) * kargs.stride_a * sizeof(D_A));
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b) + batch_id * kargs.stride_b_batch + col * kargs.stride_b, (kargs.n - col) * kargs.stride_b * sizeof(D_B));
@@ -533,4 +547,6 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
     store_c(v_c[0][1], 0, 1);
     store_c(v_c[1][0], 1, 0);
     store_c(v_c[1][1], 1, 1);
+    __builtin_amdgcn_s_barrier();
+    }
 }
