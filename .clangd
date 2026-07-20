@@ -1,0 +1,17 @@
+CompileFlags:
+  Compiler: /usr/bin/amdclang++
+  Add:
+    # Allows includes such as <opus/opus.hpp> to resolve to
+    # /workspace/gcnasm/wmma_opus_rdna4/opus/opus.hpp.
+    - -std=c++17
+    - -x
+    - hip
+    - -I/workspace/gcnasm/mla_agentic_v0/third_party/aiter/csrc/include
+    - -I/usr/lib/x86_64-linux-gnu/openmpi/include
+    - -I/workspace/gcnasm/.venv/lib/python3.12/site-packages/mori/_jit-sources/include
+    # clangd only: keep dependent HIP launch attributes from breaking parsing.
+    - "-D__launch_bounds__(...)="
+    # clangd only: these are normally provided by the device stub include chain.
+    - "-Dblock_id_x()=__builtin_amdgcn_workgroup_id_x()"
+    - "-Dblock_id_z()=__builtin_amdgcn_workgroup_id_z()"
+    - "-Dthread_id_x()=__builtin_amdgcn_workitem_id_x()"

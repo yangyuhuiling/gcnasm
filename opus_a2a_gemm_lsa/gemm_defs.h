@@ -1,0 +1,41 @@
+#pragma once
+
+#include "../opus_dist_gemm/gemm_defs.h"
+
+struct opus_a2a_gemm_kargs {
+    const void* __restrict__ local_a = nullptr;   // [M, K_SHARD], bf16
+    const void* __restrict__ ptr_b = nullptr;     // [N, K], bf16, replicated on every rank
+    void* __restrict__ ptr_c = nullptr;           // [M, N], bf16
+    void* __restrict__ workspace = nullptr;       // [M, N], fp32 accumulation workspace
+
+    void* recv_a_win = nullptr;                   // LSA window: [rank_count, M, K_SHARD], bf16
+    void* ready_win = nullptr;                    // LSA window: [rank_count], uint32 flags
+    void* recv_a_local = nullptr;                 // local device pointer for this rank's recv_a window
+    void* ready_local = nullptr;                  // local device pointer for this rank's ready flags
+
+    unsigned int* wg_hw_records = nullptr;        // optional [wg_hw_record_count, 6]: bx,xcc,se,sh,cu,is_comm
+
+    int m = 2048;
+    int n = 8192;
+    int k = 8192;
+    int k_shard = 1024;
+    int rank_count = 8;
+    int my_rank = 0;
+
+    int stride_a = 1024;      // local/recv A shard row stride
+    int stride_b = 8192;      // full B row stride
+    int stride_c = 8192;      // output C row stride
+    int stride_ws = 8192;     // FP32 workspace row stride
+
+    unsigned int recv_a_bytes = 0;
+    unsigned int ready_bytes = 0;
+    unsigned int output_bytes = 0;
+    unsigned int workspace_bytes = 0;
+
+    int comm_wgs = 32;             // active rotate-copy WGs; placed every 8th WG in fused mode
+    int wg_hw_record_count = 0;
+    int record_wg_hw = 0;
+    int num_m_tiles = 0;
+    int num_n_tiles = 0;
+    int mode = 0;             // 0=fused, 1=compute-only-local full-K
+};
