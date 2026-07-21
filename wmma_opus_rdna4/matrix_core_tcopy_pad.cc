@@ -13,7 +13,7 @@
 
 #include "opus/opus.hpp"
 #include "reg_access_uitls.h"
-#include "tcopy_desc_utils.h"
+// tcopy_desc / tcopy_window now in opus.hpp
 
 #define CHECK_HIP(call)                                                                                   \
     do {                                                                                                  \
@@ -72,13 +72,13 @@ wmma_kernel_standard(const void* __restrict__ ptr_a,
 
     // TileDim0=128(K), TileDim1=16(M/N); LdsPadEn=1, PadInterval=5(256B), PadAmount=3(16B)
     using NoSelectedWgs = opus::seq<>;
-    using Wmma16x16x128Tcopy = TcopyDesc<fp16_t, 128, 16, 0, 0, 0,
+    using Wmma16x16x128Tcopy = tcopy_window<fp16_t, 128, 16, 0, 0, 0,
     1, 0, 0, 0, 1, 0, 0, 0,
     0, 1, 5, 3, NoSelectedWgs>;
 
-    Wmma16x16x128Tcopy tcopy_a, tcopy_b;
-    tcopy_a.make(smembase, ptr_a, Block_K, 16, stride_a);
-    tcopy_b.make(smembase + 16 * Block_K * sizeof(fp16_t) + 16 * 8 * sizeof(fp16_t), ptr_b, Block_K, 16, stride_b);
+    Wmma16x16x128Tcopy win_a, win_b;
+    win_a.make(smembase, ptr_a, /*lds_off=*/0,                                                    Block_K, 16, stride_a);
+    win_b.make(smembase, ptr_b, /*lds_off=*/16 * Block_K * sizeof(fp16_t) + 16 * 8 * sizeof(fp16_t), Block_K, 16, stride_b);
 
     // ── block_sld A/B: same construction as matrix_core_gfx942.cc (smem load windows)
     // 32-lane wave: AKSldLane×AMSldLane = 2×16 (gfx942 uses 4×16 on 64-lane)
@@ -130,8 +130,8 @@ wmma_kernel_standard(const void* __restrict__ ptr_a,
     constexpr int smem_b_base_bytes = 16 * Block_K * static_cast<int>(sizeof(fp16_t))
                                       + 16 * 8 * static_cast<int>(sizeof(fp16_t));
 
-    __builtin_amdgcn_tensor_load_to_lds(tcopy_a.sg0.as<int32x4_t>(), tcopy_a.sg1.as<int32x8_t>(), {0,0,0,0}, {0,0,0,0}, 27);
-    __builtin_amdgcn_tensor_load_to_lds(tcopy_b.sg0.as<int32x4_t>(), tcopy_b.sg1.as<int32x8_t>(), {0,0,0,0}, {0,0,0,0}, 27);
+    win_a.load_to_lds();
+    win_b.load_to_lds();
 
     __builtin_amdgcn_s_wait_tensorcnt(0);
 

@@ -13,7 +13,7 @@
 
 #include "opus/opus.hpp"
 #include "reg_access_uitls.h"
-#include "tcopy_desc_utils.h"
+// tcopy_desc / tcopy_window now in opus.hpp
 #include "named_barrier.hpp"
 
 #define CHECK_HIP(call)                                                                                   \
@@ -80,7 +80,7 @@ wmma_kernel_standard(const void* __restrict__ ptr_a,
     uintptr_t smembase = reinterpret_cast<uintptr_t>(Smem);
 
     using NoSelectedWgs = opus::seq<>;
-    using Wmma16x16x128Tcopy = TcopyDesc<fp16_t, 128, 16, 0, 0, 0,
+    using Wmma16x16x128Tcopy = tcopy_window<fp16_t, 128, 16, 0, 0, 0,
     1, 0, 0, 0, 1, 0, 0, 0,
     0, 1, 5, 3, NoSelectedWgs>;
 
@@ -91,13 +91,14 @@ wmma_kernel_standard(const void* __restrict__ ptr_a,
             asm volatile(";LOAD A START\n\t");
             __builtin_amdgcn_s_barrier_signal(-1);
             __builtin_amdgcn_s_barrier_wait(-1);
-            Wmma16x16x128Tcopy tcopy_a;
-            tcopy_a.make(smembase + wave_id * 16 * Block_K * sizeof(fp16_t) + wave_id * 16 * 8 * sizeof(fp16_t), 
-                         static_cast<const char*>(ptr_a) + wave_id * 16 * Block_K * sizeof(fp16_t),
-                         Block_K, 
-                         Block_M - wave_id * 16,
-                         stride_a);
-            __builtin_amdgcn_tensor_load_to_lds(tcopy_a.sg0.as<int32x4_t>(), tcopy_a.sg1.as<int32x8_t>(), {0,0,0,0}, {0,0,0,0}, 27);
+            Wmma16x16x128Tcopy win_a;
+            win_a.make(/*lds_base*/ smembase,
+                       /*global_base*/ ptr_a,
+                       /*lds_off*/ wave_id * 16 * (Block_K + 8) * sizeof(fp16_t),
+                       /*td0*/ Block_K, /*td1*/ Block_M - wave_id * 16,
+                       /*stride0*/ stride_a,
+                       /*origin0*/ 0, /*origin1*/ static_cast<uint32_t>(wave_id * 16));
+            win_a.load_to_lds();
             s_barrier_join_ptr(&__nbar_1);
             __builtin_amdgcn_s_wait_tensorcnt(0);
             __builtin_amdgcn_s_barrier_signal(1);
@@ -112,13 +113,14 @@ wmma_kernel_standard(const void* __restrict__ ptr_a,
             asm volatile(";LOAD B START\n\t");
             __builtin_amdgcn_s_barrier_signal(-1);
             __builtin_amdgcn_s_barrier_wait(-1);
-            Wmma16x16x128Tcopy tcopy_b;
-            tcopy_b.make(smembase + wave_id * 16 * Block_K * sizeof(fp16_t) + wave_id * 16 * 8 * sizeof(fp16_t), 
-                         static_cast<const char*>(ptr_b) + (wave_id - 2) * 16 * Block_K * sizeof(fp16_t),
-                         Block_K, 
-                         Block_N - (wave_id - 2) * 16, 
-                         stride_b);
-            __builtin_amdgcn_tensor_load_to_lds(tcopy_b.sg0.as<int32x4_t>(), tcopy_b.sg1.as<int32x8_t>(), {0,0,0,0}, {0,0,0,0}, 27);
+            Wmma16x16x128Tcopy win_b;
+            win_b.make(/*lds_base*/ smembase,
+                       /*global_base*/ ptr_b,
+                       /*lds_off*/ wave_id * 16 * (Block_K + 8) * sizeof(fp16_t),
+                       /*td0*/ Block_K, /*td1*/ Block_N - (wave_id - 2) * 16,
+                       /*stride0*/ stride_b,
+                       /*origin0*/ 0, /*origin1*/ static_cast<uint32_t>((wave_id - 2) * 16));
+            win_b.load_to_lds();
             s_barrier_join_ptr(&__nbar_1);
             __builtin_amdgcn_s_wait_tensorcnt(0);
             __builtin_amdgcn_s_barrier_signal(1);

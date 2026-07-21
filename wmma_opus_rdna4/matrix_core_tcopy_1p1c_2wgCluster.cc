@@ -13,7 +13,7 @@
 
 #include "opus/opus.hpp"
 #include "reg_access_uitls.h"
-#include "tcopy_desc_utils.h"
+// tcopy_desc / tcopy_window now in opus.hpp
 #include "named_barrier.hpp"
 
 #define CHECK_HIP(call)                                                                                   \
@@ -83,11 +83,11 @@ wmma_kernel_standard(const void* __restrict__ ptr_a,
     uintptr_t smembase = reinterpret_cast<uintptr_t>(Smem);
 
     using NoSelectedWgs = opus::seq<>;
-    using Wmma16x16x128Tcopy = TcopyDesc<fp16_t, 128, 16, 0, 0, 0,
+    using Wmma16x16x128Tcopy = tcopy_desc<fp16_t, 128, 16, 0, 0, 0,
     1, 0, 0, 0, 1, 0, 0, 0,
     0, 1, 5, 3, NoSelectedWgs>;
     using SelectedWgs = opus::seq<0, 1>;
-    using Wmma16x16x128TcopySelected = TcopyDesc<fp16_t, 128, 16, 0, 0, 0,
+    using Wmma16x16x128TcopySelected = tcopy_desc<fp16_t, 128, 16, 0, 0, 0,
     1, 0, 0, 0, 1, 0, 0, 0,
     2, 1, 5, 3, SelectedWgs>;
 
@@ -104,7 +104,7 @@ wmma_kernel_standard(const void* __restrict__ ptr_a,
                          Block_K, 
                          Block_M - wave_id * 16,
                          stride_a);
-            __builtin_amdgcn_tensor_load_to_lds(tcopy_a.sg0.as<int32x4_t>(), tcopy_a.sg1.as<int32x8_t>(), {0,0,0,0}, {0,0,0,0}, 27);
+            __builtin_amdgcn_tensor_load_to_lds(tcopy_a.sg0.as<int32x4_t>(), tcopy_a.sg1.as<int32x8_t>(), {0,0,0,0}, {0,0,0,0}, int32x8_t{0,0,0,0,0,0,0,0}, 27);
             s_barrier_join_ptr(&__nbar_1);
             __builtin_amdgcn_s_wait_tensorcnt(0);
             __builtin_amdgcn_s_barrier_signal(1);
@@ -125,7 +125,7 @@ wmma_kernel_standard(const void* __restrict__ ptr_a,
                          Block_K, 
                          Block_N - (wave_id - 2) * 16, 
                          stride_b);
-            __builtin_amdgcn_tensor_load_to_lds(tcopy_b.sg0.as<int32x4_t>(), tcopy_b.sg1.as<int32x8_t>(), {0,0,0,0}, {0,0,0,0}, 27);
+            __builtin_amdgcn_tensor_load_to_lds(tcopy_b.sg0.as<int32x4_t>(), tcopy_b.sg1.as<int32x8_t>(), {0,0,0,0}, {0,0,0,0}, int32x8_t{0,0,0,0,0,0,0,0}, 27);
             s_barrier_join_ptr(&__nbar_1);
             __builtin_amdgcn_s_wait_tensorcnt(0);
             __builtin_amdgcn_s_barrier_signal(1);
