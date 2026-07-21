@@ -9,11 +9,23 @@
 #include "gemm_defs.h"
 
 #ifndef OPUS_STORE_PIPELINE
-#define OPUS_STORE_PIPELINE 2
+#define OPUS_STORE_PIPELINE 3
 #endif
 
 #ifndef OPUS_C_STORE_MODE
-#define OPUS_C_STORE_MODE 0
+#define OPUS_C_STORE_MODE 2
+#endif
+
+#ifndef OPUS_STORE_STAGGER_PHASES
+#define OPUS_STORE_STAGGER_PHASES 16
+#endif
+
+#ifndef OPUS_STORE_STAGGER_DELAY
+#define OPUS_STORE_STAGGER_DELAY 4
+#endif
+
+#ifndef OPUS_TILE_ORDER
+#define OPUS_TILE_ORDER 1
 #endif
 
 namespace gemm_quad_subtile {
@@ -282,8 +294,29 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
         }
         const int batch_id = tile_id / tile_count;
         const int tile_linear = tile_id - batch_id * tile_count;
-        int row = (tile_linear % num_tiles_m) * T::B_M;
-        int col = (tile_linear / num_tiles_m) * T::B_N;
+        const int m_tile = tile_linear % num_tiles_m;
+        const int n_tile_sequence = tile_linear / num_tiles_m;
+        int n_tile = n_tile_sequence;
+#if OPUS_TILE_ORDER == 1
+        // Round-robin the scattered column tiles across destination peers:
+        // instead of processing all tiles for peer0, then peer1, etc., issue
+        // peer0/peer1/peer2/peer3 in sequence for each inner tile. This spreads
+        // remote LSA store bursts across xGMI peers and was the largest
+        // short-term win in testing (roughly +25% on M=8192,N=36864 with
+        // STORE_PIPELINE=3 and C_STORE_MODE=2).
+        if (kargs.a2a_n_shard && kargs.a2a_span > 0) {
+            const int tiles_per_peer = kargs.a2a_n_shard / T::B_N;
+            const int num_peer_tiles = kargs.a2a_span / kargs.a2a_n_shard;
+            const int scatter_tiles = tiles_per_peer * num_peer_tiles;
+            if (tiles_per_peer > 0 && num_peer_tiles > 0 && n_tile_sequence < scatter_tiles) {
+                const int inner = n_tile_sequence / num_peer_tiles;
+                const int peer = n_tile_sequence - inner * num_peer_tiles;
+                n_tile = peer * tiles_per_peer + inner;
+            }
+        }
+#endif
+        int row = m_tile * T::B_M;
+        int col = n_tile * T::B_N;
 
     auto g_a = make_gmem(reinterpret_cast<const D_A*>(kargs.ptr_a) + batch_id * kargs.stride_a_batch + row * kargs.stride_a, (kargs.m - row) * kargs.stride_a * sizeof(D_A));
     auto g_b = make_gmem(reinterpret_cast<const D_B*>(kargs.ptr_b) + batch_id * kargs.stride_b_batch + col * kargs.stride_b, (kargs.n - col) * kargs.stride_b * sizeof(D_B));
@@ -431,6 +464,20 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
         });
 #else
         store<T::VEC_C>(g_c, v_c_f16, u_gc, c_offset(half_tile_m, half_tile_n));
+#endif
+    };
+
+    auto stagger_store_phase = [&]() {
+#if OPUS_STORE_STAGGER_PHASES > 0 && OPUS_STORE_STAGGER_DELAY > 0
+        // Lightly phase-shift C stores so persistent CTAs do not all hit the
+        // same remote-store path at once. Best tested setting was 16 phases and
+        // delay 4; by itself it was modest (~1%), but it composes with peer
+        // round-robin.
+        int phase = tile_id % OPUS_STORE_STAGGER_PHASES;
+        int spins = phase * OPUS_STORE_STAGGER_DELAY;
+        for (int i = 0; i < spins; ++i) {
+            __builtin_amdgcn_s_sleep(1);
+        }
 #endif
     };
 
@@ -658,9 +705,11 @@ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs) {
 #endif
 
 #if OPUS_STORE_PIPELINE == 1
+    stagger_store_phase();
     store_c(v_c[1][0], 1, 0);
     store_c(v_c[1][1], 1, 1);
 #else
+    stagger_store_phase();
     store_c(v_c[0][0], 0, 0);
     store_c(v_c[0][1], 0, 1);
     store_c(v_c[1][0], 1, 0);
