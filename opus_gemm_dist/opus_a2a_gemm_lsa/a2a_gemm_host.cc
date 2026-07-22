@@ -5,7 +5,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
-#include <vector>
 
 #include <omp.h>
 #include <hip/hip_runtime.h>
@@ -59,7 +58,7 @@ extern "C" ncclResult_t ncclRecv(void* recvbuff, size_t count, int datatype, int
         }                                                                                                  \
     } while (0)
 
-template<typename Traits, int Mode>
+template<typename Traits, int Mode, bool Persistent>
 __global__ void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs);
 template<typename Traits>
 __global__ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs);
@@ -82,7 +81,6 @@ __global__ void pack_a_shards_kernel(const bf16_t* __restrict__ recv,
     }
 }
 
-static constexpr int kRanks = 8;
 static constexpr size_t kPerRankVmm = 512ULL * 1024 * 1024;
 
 static float a_value(int src_rank, int row, int k_local) {
@@ -151,6 +149,8 @@ int main(int argc, char** argv) {
     int iters = 1;
     int mode = 0;
     int comm_wgs = 4;
+    int persistent = 0;
+    int compute_wgs_arg = 0;
     bool record_wg_hw = false;
     bool validate = true;
     for (int i = 1; i < argc; ++i) {
@@ -161,12 +161,14 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--iters") == 0 && i + 1 < argc) iters = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--mode") == 0 && i + 1 < argc) mode = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--comm-wgs") == 0 && i + 1 < argc) comm_wgs = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--persistent") == 0 && i + 1 < argc) persistent = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--compute-wgs") == 0 && i + 1 < argc) compute_wgs_arg = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--record-wg-hw") == 0) record_wg_hw = true;
         else if (std::strcmp(argv[i], "--no-validate") == 0) validate = false;
     }
 
-    if (nranks != kRanks) {
-        if (rank == 0) fprintf(stderr, "requires exactly %d ranks\n", kRanks);
+    if (nranks != 4 && nranks != 8) {
+        if (rank == 0) fprintf(stderr, "requires exactly 4 or 8 ranks\n");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
@@ -185,10 +187,20 @@ int main(int argc, char** argv) {
         if (rank == 0) fprintf(stderr, "unsupported mode: only 0=fused, 1=compute-only, 2=RCCL-A2A+GEMM are enabled\n");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
+    if ((persistent != 0 && persistent != 1) || (persistent && mode != 0)) {
+        if (rank == 0) fprintf(stderr, "--persistent must be 0 or 1 and is only supported with --mode 0\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    if (compute_wgs_arg < 0) {
+        if (rank == 0) fprintf(stderr, "--compute-wgs must be non-negative\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
 
     int ndev = 0;
     CHECK_HIP(hipGetDeviceCount(&ndev));
     CHECK_HIP(hipSetDevice(rank % ndev));
+    int cu_count = 0;
+    CHECK_HIP(hipDeviceGetAttribute(&cu_count, hipDeviceAttributeMultiprocessorCount, rank % ndev));
 
     ccoUniqueId uid;
     if (rank == 0) CHECK_CCO(ccoGetUniqueId(&uid));
@@ -216,7 +228,23 @@ int main(int argc, char** argv) {
     const bool n_outer_mode = mode == 1;
     const int compute_tasks = n_outer_mode ? (num_m_tiles * kComputeNWorkers)
                                            : (num_m_tiles * num_n_tiles);
-    const int grid_wgs = n_outer_mode ? compute_tasks : (compute_tasks + comm_wgs);
+    int compute_wgs = compute_tasks;
+    if (persistent) {
+        const int auto_compute_wgs = cu_count - comm_wgs;
+        compute_wgs = compute_wgs_arg > 0 ? compute_wgs_arg : auto_compute_wgs;
+        if (compute_wgs > compute_tasks) compute_wgs = compute_tasks;
+        const int min_compute_wgs_for_interleaved_comm = 7 * (comm_wgs - 1);
+        if (compute_wgs <= 0 || compute_wgs < min_compute_wgs_for_interleaved_comm) {
+            if (rank == 0) {
+                fprintf(stderr,
+                        "persistent compute WG count %d is too small for %d interleaved comm WGs\n",
+                        compute_wgs, comm_wgs);
+            }
+            MPI_Abort(MPI_COMM_WORLD, 1);
+        }
+    }
+    const int grid_wgs = n_outer_mode ? compute_tasks
+                                      : ((persistent ? compute_wgs : compute_tasks) + comm_wgs);
     static constexpr int kHwRecordWidth = 6;
     const size_t hw_record_elems = static_cast<size_t>(grid_wgs) * kHwRecordWidth;
 
@@ -231,12 +259,14 @@ int main(int argc, char** argv) {
     bf16_t* d_b = nullptr;
     bf16_t* d_c = nullptr;
     unsigned int* d_wg_hw_records = nullptr;
+    unsigned int* d_tile_counter = nullptr;
     CHECK_HIP(hipMalloc(&d_a, a_elems * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&d_a_full, a_full_elems * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&d_a_recv, recv_elems * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&d_b, b_elems * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&d_c, c_elems * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&d_wg_hw_records, hw_record_elems * sizeof(unsigned int)));
+    CHECK_HIP(hipMalloc(&d_tile_counter, sizeof(unsigned int)));
     CHECK_HIP(hipMemcpy(d_a, h_a.get(), a_elems * sizeof(bf16_t), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(d_b, h_b.get(), b_elems * sizeof(bf16_t), hipMemcpyHostToDevice));
 
@@ -256,6 +286,7 @@ int main(int argc, char** argv) {
     kargs.recv_a_local = recv_local;
     kargs.ready_local = ready_local;
     kargs.wg_hw_records = d_wg_hw_records;
+    kargs.tile_counter = d_tile_counter;
     kargs.m = M;
     kargs.n = N;
     kargs.k = K;
@@ -296,6 +327,7 @@ int main(int argc, char** argv) {
     dim3 gemm_grid(num_m_tiles * num_n_tiles, 1, 1);
     dim3 pack_grid(ceil_div(static_cast<int>(a_full_elems), 256), 1, 1);
     dim3 pack_block(256, 1, 1);
+    const unsigned int tile_counter_start = persistent ? static_cast<unsigned int>(compute_wgs) : 0u;
 
     auto clear_for_launch = [&]() {
         CHECK_HIP(hipMemset(recv_local, 0, recv_elems * sizeof(bf16_t)));
@@ -304,6 +336,8 @@ int main(int argc, char** argv) {
         CHECK_HIP(hipMemset(d_a_recv, 0, recv_elems * sizeof(bf16_t)));
         CHECK_HIP(hipMemset(d_c, 0, c_elems * sizeof(bf16_t)));
         CHECK_HIP(hipMemset(d_wg_hw_records, 0xff, hw_record_elems * sizeof(unsigned int)));
+        CHECK_HIP(hipMemcpy(d_tile_counter, &tile_counter_start, sizeof(tile_counter_start),
+                            hipMemcpyHostToDevice));
         CHECK_HIP(hipMemcpy(static_cast<char*>(recv_local) + static_cast<size_t>(rank) * a_elems * sizeof(bf16_t),
                             d_a, a_elems * sizeof(bf16_t), hipMemcpyDeviceToDevice));
         CHECK_HIP(hipDeviceSynchronize());
@@ -326,9 +360,13 @@ int main(int argc, char** argv) {
 
     auto launch_once = [&]() {
         if (mode == 0) {
-            a2a_gemm_lsa_kernel<Traits, 0><<<grid, block>>>(kargs);
+            if (persistent) {
+                a2a_gemm_lsa_kernel<Traits, 0, true><<<grid, block>>>(kargs);
+            } else {
+                a2a_gemm_lsa_kernel<Traits, 0, false><<<grid, block>>>(kargs);
+            }
         } else if (mode == 1) {
-            a2a_gemm_lsa_kernel<Traits, 1><<<grid, block>>>(kargs);
+            a2a_gemm_lsa_kernel<Traits, 1, false><<<grid, block>>>(kargs);
         } else {
             launch_nonfused_once();
         }
@@ -395,7 +433,7 @@ int main(int argc, char** argv) {
         auto h_c = std::make_unique<bf16_t[]>(c_elems);
         CHECK_HIP(hipMemcpy(h_c.get(), d_c, c_elems * sizeof(bf16_t), hipMemcpyDeviceToHost));
 
-        const int sample_rows[] = {0, 17, 255, 511, 1023, 1536, 2047};
+        const int sample_rows[] = {0, 17, 255, 511, M / 2, M - 1};
         const int sample_cols[] = {0, 127, 255, 1024, 4096, 8191};
         for (int r : sample_rows) {
             if (r >= M) continue;
@@ -420,8 +458,9 @@ int main(int argc, char** argv) {
     MPI_Reduce(&mism, &total_mism, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     if (rank == 0) {
         const double flops = 2.0 * double(M) * double(N) * double(K);
-        printf("a2a_gemm_lsa M=%d N=%d K=%d ranks=%d mode=%d comm_wgs=%d grid_wgs=%d max_rank_time=%.4f ms %.2f TFLOP/s %s\n",
-               M, N, K, nranks, mode, comm_wgs, grid_wgs,
+        printf("a2a_gemm_lsa M=%d N=%d K=%d ranks=%d mode=%d persistent=%d comm_wgs=%d compute_wgs=%d grid_wgs=%d max_rank_time=%.4f ms %.2f TFLOP/s %s\n",
+               M, N, K, nranks, mode, persistent, comm_wgs,
+               persistent ? compute_wgs : compute_tasks, grid_wgs,
                max_ms, flops / (max_ms * 1.0e9),
                (!validate || total_mism == 0) ? "SUCCESS" : "FAILED");
     }
@@ -438,6 +477,7 @@ int main(int argc, char** argv) {
     CHECK_HIP(hipFree(d_b));
     CHECK_HIP(hipFree(d_c));
     CHECK_HIP(hipFree(d_wg_hw_records));
+    CHECK_HIP(hipFree(d_tile_counter));
     MPI_Finalize();
     return (!validate || total_mism == 0) ? 0 : 1;
 }

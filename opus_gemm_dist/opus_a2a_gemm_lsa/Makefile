@@ -1,6 +1,6 @@
-OPUS_INCLUDE_DIR ?= /shared/amdgpu/home/jiahao_zhou_qle/blyu/aiter/csrc/include
-MORI_INCLUDE_DIR ?= /shared/amdgpu/home/jiahao_zhou_qle/blyu/mori/include
-MORI_LIB_DIR     ?= /shared/amdgpu/home/jiahao_zhou_qle/blyu/mori/python/mori
+OPUS_INCLUDE_DIR ?= ../../mla_agentic_v0/third_party/aiter/csrc/include
+MORI_INCLUDE_DIR ?= /workspace/mori/include
+MORI_LIB_DIR     ?= /workspace/mori/build/src/cco
 HIPCC            ?= /opt/rocm/bin/hipcc
 ARCH             ?= gfx950
 
@@ -26,7 +26,7 @@ $(BUILD):
 $(BUILD)/a2a_gemm_kernel.o: a2a_gemm_kernel.cc a2a_gemm_kernel_template.hpp gemm_defs.h | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage -save-temps=obj -c -o $@
 
-$(BUILD)/gemm_a16w16_quad_subtile_kernel.o: ../opus_dist_gemm/gemm_a16w16_quad_subtile_kernel.cc ../opus_dist_gemm/gemm_a16w16_quad_subtile_kernel_template.hpp ../opus_dist_gemm/gemm_defs.h | $(BUILD)
+$(BUILD)/gemm_a16w16_quad_subtile_kernel.o: ../opus_gemm_a2a_lsa/gemm_a16w16_quad_subtile_kernel.cc ../opus_gemm_a2a_lsa/gemm_a16w16_quad_subtile_kernel_template.hpp ../opus_gemm_a2a_lsa/gemm_defs.h | $(BUILD)
 	$(HIPCC) $< $(COMMON_FLAGS) -D__HIPCC_RTC__ -Rpass-analysis=kernel-resource-usage -save-temps=obj -c -o $@
 
 $(BUILD)/a2a_gemm_host.o: a2a_gemm_host.cc gemm_defs.h | $(BUILD)

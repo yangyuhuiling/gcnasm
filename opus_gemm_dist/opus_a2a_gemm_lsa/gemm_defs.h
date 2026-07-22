@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../opus_dist_gemm/gemm_defs.h"
+#include "../opus_gemm_a2a_lsa/gemm_defs.h"
 
 struct opus_a2a_gemm_kargs {
     const void* __restrict__ local_a = nullptr;   // [M, K_SHARD], bf16
@@ -14,6 +14,7 @@ struct opus_a2a_gemm_kargs {
     void* ready_local = nullptr;                  // local device pointer for this rank's ready flags
 
     unsigned int* wg_hw_records = nullptr;        // optional [wg_hw_record_count, 6]: bx,xcc,se,sh,cu,is_comm
+    unsigned int* tile_counter = nullptr;         // persistent compute task counter
 
     int m = 2048;
     int n = 8192;

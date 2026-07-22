@@ -8,5 +8,7 @@
 *.hipfb
 *.egg
 build/
+opus_gemm_dist/opus_gemm_a2a_lsa/build_nonpersistent/
+opus_gemm_dist/opus_gemm_a2a_lsa/build_persistent/
 dist/
 *_hip.*

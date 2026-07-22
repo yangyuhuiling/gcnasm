@@ -1,7 +1,7 @@
 #pragma once
 
 #include "gemm_defs.h"
-#include "../opus_dist_gemm/gemm_a16w16_quad_subtile_kernel_template.hpp"
+#include "../opus_gemm_a2a_lsa/gemm_a16w16_quad_subtile_kernel_template.hpp"
 
 namespace a2a_gemm_lsa {
 
@@ -50,12 +50,13 @@ __device__ inline void copy_local_a_to_peer(opus_a2a_gemm_kargs kargs, int comm_
     const int tid = opus::thread_id_x();
     const int src_rank = kargs.my_rank;
     const int step_count = kargs.rank_count - 1;
+    const int rank_mask = kargs.rank_count - 1;
     const size_t bytes = static_cast<size_t>(kargs.m) * kargs.k_shard * sizeof(typename T::D_A);
     const size_t vec_count = bytes / sizeof(copy_vec_t);
     const copy_vec_t* src = reinterpret_cast<const copy_vec_t*>(kargs.local_a);
 
     for (int step = 1; step <= step_count; ++step) {
-        const int dst_rank = (src_rank - step + kargs.rank_count) & 7;
+        const int dst_rank = (src_rank - step + kargs.rank_count) & rank_mask;
         char* peer_a = static_cast<char*>(cco_lsa_peer_c(kargs.recv_a_win, dst_rank));
         copy_vec_t* dst = reinterpret_cast<copy_vec_t*>(peer_a + static_cast<size_t>(src_rank) * bytes);
 
@@ -126,10 +127,11 @@ __device__ inline void wait_input_ready(opus_a2a_gemm_kargs kargs, int k_part, i
 
 }  // namespace a2a_gemm_lsa
 
-template<typename UserTraits, int Mode>
+template<typename UserTraits, int Mode, bool Persistent = false>
 __global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
 void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs) {
     static_assert(Mode == 0 || Mode == 1);
+    static_assert(!Persistent || Mode == 0, "persistent scheduling is only enabled for fused mode");
     using namespace opus;
     using namespace gemm_quad_subtile;
     using namespace a2a_gemm_lsa;
@@ -171,18 +173,27 @@ void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs) {
     if constexpr (Mode == 0) {
         comm_before = bx < comm_span ? ((bx + kXccStride - 1) >> 3) : kargs.comm_wgs;
     }
-    const int compute_task = bx - comm_before;
-    constexpr int kNumMTiles = 2048 / T::B_M;
-    constexpr int kNumNTiles = 8192 / T::B_N;
+    const int compute_worker = bx - comm_before;
     constexpr int kComputeNWorkers = 28;
-    constexpr int kMode0TileCount = kNumMTiles * kNumNTiles;
-    static_assert(kNumMTiles == 8);
-    static_assert(kNumNTiles == 32);
-    static_assert((kMode0TileCount & (kMode0TileCount - 1)) == 0);
-    static_assert((kNumNTiles & (kNumNTiles - 1)) == 0);
 
-    const int compute_tile_count = Mode == 1 ? (kNumMTiles * kComputeNWorkers)
-                                             : (kNumMTiles * kargs.num_n_tiles);
+    const int compute_tile_count = Mode == 1 ? (kargs.num_m_tiles * kComputeNWorkers)
+                                             : (kargs.num_m_tiles * kargs.num_n_tiles);
+    __shared__ unsigned int next_compute_task;
+    bool first_compute_task = true;
+
+    while (true) {
+    int compute_task = compute_worker;
+    if constexpr (Persistent) {
+        if (first_compute_task) {
+            first_compute_task = false;
+        } else {
+            if (tid == 0) {
+                next_compute_task = __atomic_fetch_add(kargs.tile_counter, 1u, __ATOMIC_RELAXED);
+            }
+            __builtin_amdgcn_s_barrier();
+            compute_task = static_cast<int>(next_compute_task);
+        }
+    }
     if (compute_task >= compute_tile_count) {
         return;
     }
@@ -195,9 +206,9 @@ void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs) {
         n_worker = compute_task - m_tile * kComputeNWorkers;
         n_tile_initial = n_worker;
     } else {
-        if (kargs.num_n_tiles == kNumNTiles) {
+        if (kargs.num_n_tiles == 32) {
             m_tile = compute_task >> 5;
-            n_tile_initial = compute_task & (kNumNTiles - 1);
+            n_tile_initial = compute_task & 31;
         } else {
             m_tile = compute_task / 31;
             n_tile_initial = compute_task - m_tile * 31;
@@ -263,7 +274,7 @@ void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs) {
     constexpr int kFullLocalShardTiles = 1024 / T::B_K;
     static_assert((kFullLocalShardTiles & (kFullLocalShardTiles - 1)) == 0);
     auto ordered_part = [&](int tile_k) {
-        return (kargs.my_rank + (tile_k >> 4)) & 7;
+        return (kargs.my_rank + (tile_k >> 4)) & (kargs.rank_count - 1);
     };
     auto a_offset = [&](int half_tile_m, int tile_k) {
         const int shard_tile_k = tile_k & (kFullLocalShardTiles - 1);
@@ -508,5 +519,9 @@ void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs) {
         if (n_worker + kComputeNWorkers < kargs.num_n_tiles) {
             compute_one_n_tile(n_worker + kComputeNWorkers);
         }
+    }
+    if constexpr (!Persistent) {
+        return;
+    }
     }
 }
