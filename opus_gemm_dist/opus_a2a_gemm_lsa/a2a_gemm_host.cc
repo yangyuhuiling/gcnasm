@@ -12,6 +12,13 @@
 
 #include "gemm_defs.h"
 
+#ifndef A2A_GEMM_COMM_WG_PLACEMENT
+#define A2A_GEMM_COMM_WG_PLACEMENT 1
+#endif
+#ifndef A2A_GEMM_TILE_READY
+#define A2A_GEMM_TILE_READY 0
+#endif
+
 using namespace mori::cco;
 
 using ncclResult_t = int;
@@ -83,40 +90,49 @@ __global__ void pack_a_shards_kernel(const bf16_t* __restrict__ recv,
 
 static constexpr size_t kPerRankVmm = 512ULL * 1024 * 1024;
 
-static float a_value(int src_rank, int row, int k_local) {
-    return 0.001f * float(src_rank + 1) + 0.0002f * float((row % 17) - 8) +
+static float a_value(int src_rank, int dst_rank, int row, int k_local) {
+    return 0.001f * float(src_rank + 1) + 0.0003f * float(dst_rank) +
+           0.0002f * float((row % 17) - 8) +
            0.0001f * float((k_local % 29) - 14);
 }
 
-static float b_value(int col, int global_k) {
-    return 0.0003f * float((col % 23) - 11) + 0.0001f * float((global_k % 31) - 15);
+static float b_value(int dst_rank, int col, int global_k) {
+    return 0.0002f * float(dst_rank) + 0.0003f * float((col % 23) - 11) +
+           0.0001f * float((global_k % 31) - 15);
 }
 
-static void fill_a(bf16_t* a, int rank, int m, int k_shard) {
-#pragma omp parallel for collapse(2)
-    for (int r = 0; r < m; ++r) {
-        for (int k = 0; k < k_shard; ++k) {
-            a[r * k_shard + k] = static_cast<bf16_t>(a_value(rank, r, k));
+static void fill_a(bf16_t* a, int rank, int rank_count, int m, int k_shard, int input_mode) {
+    const int chunks = input_mode == OPUS_A2A_INPUT_GENERIC ? rank_count : 1;
+#pragma omp parallel for collapse(3)
+    for (int dst = 0; dst < chunks; ++dst) {
+        for (int r = 0; r < m; ++r) {
+            for (int k = 0; k < k_shard; ++k) {
+                a[(static_cast<size_t>(dst) * m + r) * k_shard + k] =
+                    static_cast<bf16_t>(a_value(rank, dst, r, k));
+            }
         }
     }
 }
 
-static void fill_b(bf16_t* b, int n, int k) {
+static void fill_b(bf16_t* b, int rank, int n, int k, int input_mode) {
+    const int dst = input_mode == OPUS_A2A_INPUT_GENERIC ? rank : 0;
 #pragma omp parallel for collapse(2)
     for (int c = 0; c < n; ++c) {
         for (int kk = 0; kk < k; ++kk) {
-            b[c * k + kk] = static_cast<bf16_t>(b_value(c, kk));
+            b[c * k + kk] = static_cast<bf16_t>(b_value(dst, c, kk));
         }
     }
 }
 
-static float sample_ref(int row, int col, int k_shard, int ranks) {
+static float sample_ref(int dst_rank, int row, int col, int k_shard, int ranks, int input_mode) {
+    const int a_dst = input_mode == OPUS_A2A_INPUT_GENERIC ? dst_rank : 0;
+    const int b_dst = input_mode == OPUS_A2A_INPUT_GENERIC ? dst_rank : 0;
     float acc = 0.0f;
     for (int src = 0; src < ranks; ++src) {
         for (int kk = 0; kk < k_shard; ++kk) {
             const int global_k = src * k_shard + kk;
-            const float av = static_cast<float>(static_cast<bf16_t>(a_value(src, row, kk)));
-            const float bv = static_cast<float>(static_cast<bf16_t>(b_value(col, global_k)));
+            const float av = static_cast<float>(static_cast<bf16_t>(a_value(src, a_dst, row, kk)));
+            const float bv = static_cast<float>(static_cast<bf16_t>(b_value(b_dst, col, global_k)));
             acc += av * bv;
         }
     }
@@ -128,8 +144,8 @@ static float sample_ref_local_repeat(int rank, int row, int col, int k_shard, in
     for (int part = 0; part < ranks; ++part) {
         for (int kk = 0; kk < k_shard; ++kk) {
             const int global_k = part * k_shard + kk;
-            const float av = static_cast<float>(static_cast<bf16_t>(a_value(rank, row, kk)));
-            const float bv = static_cast<float>(static_cast<bf16_t>(b_value(col, global_k)));
+            const float av = static_cast<float>(static_cast<bf16_t>(a_value(rank, 0, row, kk)));
+            const float bv = static_cast<float>(static_cast<bf16_t>(b_value(0, col, global_k)));
             acc += av * bv;
         }
     }
@@ -148,9 +164,10 @@ int main(int argc, char** argv) {
     int warmup = 0;
     int iters = 1;
     int mode = 0;
-    int comm_wgs = 4;
+    int comm_wgs = 16;
     int persistent = 0;
     int compute_wgs_arg = 0;
+    int input_mode = OPUS_A2A_INPUT_BROADCAST;
     bool record_wg_hw = false;
     bool validate = true;
     for (int i = 1; i < argc; ++i) {
@@ -163,6 +180,12 @@ int main(int argc, char** argv) {
         else if (std::strcmp(argv[i], "--comm-wgs") == 0 && i + 1 < argc) comm_wgs = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--persistent") == 0 && i + 1 < argc) persistent = std::atoi(argv[++i]);
         else if (std::strcmp(argv[i], "--compute-wgs") == 0 && i + 1 < argc) compute_wgs_arg = std::atoi(argv[++i]);
+        else if (std::strcmp(argv[i], "--input-mode") == 0 && i + 1 < argc) {
+            const char* value = argv[++i];
+            if (std::strcmp(value, "broadcast") == 0) input_mode = OPUS_A2A_INPUT_BROADCAST;
+            else if (std::strcmp(value, "generic_a2a") == 0) input_mode = OPUS_A2A_INPUT_GENERIC;
+            else input_mode = -1;
+        }
         else if (std::strcmp(argv[i], "--record-wg-hw") == 0) record_wg_hw = true;
         else if (std::strcmp(argv[i], "--no-validate") == 0) validate = false;
     }
@@ -195,6 +218,16 @@ int main(int argc, char** argv) {
         if (rank == 0) fprintf(stderr, "--compute-wgs must be non-negative\n");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
+    if (input_mode != OPUS_A2A_INPUT_BROADCAST && input_mode != OPUS_A2A_INPUT_GENERIC) {
+        if (rank == 0) fprintf(stderr, "--input-mode must be broadcast or generic_a2a\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    if (input_mode == OPUS_A2A_INPUT_GENERIC && mode == 1) {
+        if (rank == 0) fprintf(stderr, "generic_a2a input is not supported with compute-only mode 1\n");
+        MPI_Abort(MPI_COMM_WORLD, 1);
+    }
+    const char* input_mode_name =
+        input_mode == OPUS_A2A_INPUT_GENERIC ? "generic_a2a" : "broadcast";
 
     int ndev = 0;
     CHECK_HIP(hipGetDeviceCount(&ndev));
@@ -209,21 +242,18 @@ int main(int argc, char** argv) {
     CHECK_CCO(ccoCommCreate(uid, nranks, rank, kPerRankVmm, &comm));
 
     ncclComm_t nccl_comm = nullptr;
-    if (mode == 2) {
-        ncclUniqueId nccl_uid;
-        if (rank == 0) CHECK_NCCL(ncclGetUniqueId(&nccl_uid));
-        MPI_Bcast(&nccl_uid, sizeof(nccl_uid), MPI_BYTE, 0, MPI_COMM_WORLD);
-        CHECK_NCCL(ncclCommInitRank(&nccl_comm, nranks, nccl_uid, rank));
-    }
 
-    const size_t a_elems = static_cast<size_t>(M) * K_SHARD;
+    const size_t a_chunk_elems = static_cast<size_t>(M) * K_SHARD;
+    const int local_a_chunks = input_mode == OPUS_A2A_INPUT_GENERIC ? nranks : 1;
+    const size_t local_a_elems = static_cast<size_t>(local_a_chunks) * a_chunk_elems;
     const size_t b_elems = static_cast<size_t>(N) * K;
     const size_t c_elems = static_cast<size_t>(M) * N;
     const size_t a_full_elems = static_cast<size_t>(M) * K;
-    const size_t recv_elems = static_cast<size_t>(nranks) * a_elems;
-    const size_t ready_elems = static_cast<size_t>(nranks);  // one completion counter per source rank
+    const size_t recv_elems = static_cast<size_t>(nranks) * a_chunk_elems;
     const int num_m_tiles = ceil_div(M, Traits::B_M);
     const int num_n_tiles = ceil_div(N, Traits::B_N);
+    const size_t ready_elems = static_cast<size_t>(nranks) *
+                               (A2A_GEMM_TILE_READY ? num_m_tiles : 1);
     static constexpr int kComputeNWorkers = 28;
     const bool n_outer_mode = mode == 1;
     const int compute_tasks = n_outer_mode ? (num_m_tiles * kComputeNWorkers)
@@ -233,7 +263,8 @@ int main(int argc, char** argv) {
         const int auto_compute_wgs = cu_count - comm_wgs;
         compute_wgs = compute_wgs_arg > 0 ? compute_wgs_arg : auto_compute_wgs;
         if (compute_wgs > compute_tasks) compute_wgs = compute_tasks;
-        const int min_compute_wgs_for_interleaved_comm = 7 * (comm_wgs - 1);
+        const int min_compute_wgs_for_interleaved_comm =
+            A2A_GEMM_COMM_WG_PLACEMENT == 0 ? 7 * (comm_wgs - 1) : 1;
         if (compute_wgs <= 0 || compute_wgs < min_compute_wgs_for_interleaved_comm) {
             if (rank == 0) {
                 fprintf(stderr,
@@ -248,10 +279,10 @@ int main(int argc, char** argv) {
     static constexpr int kHwRecordWidth = 6;
     const size_t hw_record_elems = static_cast<size_t>(grid_wgs) * kHwRecordWidth;
 
-    auto h_a = std::make_unique<bf16_t[]>(a_elems);
+    auto h_a = std::make_unique<bf16_t[]>(local_a_elems);
     auto h_b = std::make_unique<bf16_t[]>(b_elems);
-    fill_a(h_a.get(), rank, M, K_SHARD);
-    fill_b(h_b.get(), N, K);
+    fill_a(h_a.get(), rank, nranks, M, K_SHARD, input_mode);
+    fill_b(h_b.get(), rank, N, K, input_mode);
 
     bf16_t* d_a = nullptr;
     bf16_t* d_a_full = nullptr;
@@ -260,14 +291,14 @@ int main(int argc, char** argv) {
     bf16_t* d_c = nullptr;
     unsigned int* d_wg_hw_records = nullptr;
     unsigned int* d_tile_counter = nullptr;
-    CHECK_HIP(hipMalloc(&d_a, a_elems * sizeof(bf16_t)));
+    CHECK_HIP(hipMalloc(&d_a, local_a_elems * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&d_a_full, a_full_elems * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&d_a_recv, recv_elems * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&d_b, b_elems * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&d_c, c_elems * sizeof(bf16_t)));
     CHECK_HIP(hipMalloc(&d_wg_hw_records, hw_record_elems * sizeof(unsigned int)));
     CHECK_HIP(hipMalloc(&d_tile_counter, sizeof(unsigned int)));
-    CHECK_HIP(hipMemcpy(d_a, h_a.get(), a_elems * sizeof(bf16_t), hipMemcpyHostToDevice));
+    CHECK_HIP(hipMemcpy(d_a, h_a.get(), local_a_elems * sizeof(bf16_t), hipMemcpyHostToDevice));
     CHECK_HIP(hipMemcpy(d_b, h_b.get(), b_elems * sizeof(bf16_t), hipMemcpyHostToDevice));
 
     ccoWindow_t recv_win = nullptr;
@@ -276,6 +307,13 @@ int main(int argc, char** argv) {
     void* ready_local = nullptr;
     CHECK_CCO(ccoWindowRegister(comm, recv_elems * sizeof(bf16_t), &recv_win, &recv_local));
     CHECK_CCO(ccoWindowRegister(comm, ready_elems * sizeof(unsigned int), &ready_win, &ready_local));
+
+    if (mode == 2) {
+        ncclUniqueId nccl_uid;
+        if (rank == 0) CHECK_NCCL(ncclGetUniqueId(&nccl_uid));
+        MPI_Bcast(&nccl_uid, sizeof(nccl_uid), MPI_BYTE, 0, MPI_COMM_WORLD);
+        CHECK_NCCL(ncclCommInitRank(&nccl_comm, nranks, nccl_uid, rank));
+    }
 
     opus_a2a_gemm_kargs kargs{};
     kargs.local_a = d_a;
@@ -293,6 +331,7 @@ int main(int argc, char** argv) {
     kargs.k_shard = K_SHARD;
     kargs.rank_count = nranks;
     kargs.my_rank = rank;
+    kargs.input_mode = input_mode;
     kargs.stride_a = K_SHARD;
     kargs.stride_b = K;
     kargs.stride_c = N;
@@ -338,8 +377,12 @@ int main(int argc, char** argv) {
         CHECK_HIP(hipMemset(d_wg_hw_records, 0xff, hw_record_elems * sizeof(unsigned int)));
         CHECK_HIP(hipMemcpy(d_tile_counter, &tile_counter_start, sizeof(tile_counter_start),
                             hipMemcpyHostToDevice));
-        CHECK_HIP(hipMemcpy(static_cast<char*>(recv_local) + static_cast<size_t>(rank) * a_elems * sizeof(bf16_t),
-                            d_a, a_elems * sizeof(bf16_t), hipMemcpyDeviceToDevice));
+        const size_t self_src_chunk =
+            input_mode == OPUS_A2A_INPUT_GENERIC ? static_cast<size_t>(rank) : 0;
+        CHECK_HIP(hipMemcpy(static_cast<char*>(recv_local) +
+                                static_cast<size_t>(rank) * a_chunk_elems * sizeof(bf16_t),
+                            d_a + self_src_chunk * a_chunk_elems,
+                            a_chunk_elems * sizeof(bf16_t), hipMemcpyDeviceToDevice));
         CHECK_HIP(hipDeviceSynchronize());
         CHECK_CCO(ccoBarrierAll(comm));
     };
@@ -347,9 +390,12 @@ int main(int argc, char** argv) {
     auto launch_nonfused_once = [&]() {
         CHECK_NCCL(ncclGroupStart());
         for (int peer = 0; peer < nranks; ++peer) {
-            CHECK_NCCL(ncclSend(d_a, a_elems, ncclBfloat16, peer, nccl_comm, nullptr));
-            CHECK_NCCL(ncclRecv(d_a_recv + static_cast<size_t>(peer) * a_elems,
-                                a_elems, ncclBfloat16, peer, nccl_comm, nullptr));
+            const size_t send_chunk =
+                input_mode == OPUS_A2A_INPUT_GENERIC ? static_cast<size_t>(peer) : 0;
+            CHECK_NCCL(ncclSend(d_a + send_chunk * a_chunk_elems,
+                                a_chunk_elems, ncclBfloat16, peer, nccl_comm, nullptr));
+            CHECK_NCCL(ncclRecv(d_a_recv + static_cast<size_t>(peer) * a_chunk_elems,
+                                a_chunk_elems, ncclBfloat16, peer, nccl_comm, nullptr));
         }
         CHECK_NCCL(ncclGroupEnd());
         pack_a_shards_kernel<<<pack_grid, pack_block>>>(d_a_recv, d_a_full, M, K_SHARD, nranks);
@@ -440,7 +486,7 @@ int main(int argc, char** argv) {
             for (int c : sample_cols) {
                 if (c >= N) continue;
                 const float got = static_cast<float>(h_c[static_cast<size_t>(r) * N + c]);
-                float ref = sample_ref(r, c, K_SHARD, nranks);
+                float ref = sample_ref(rank, r, c, K_SHARD, nranks, input_mode);
                 if (mode == 1) ref = sample_ref_local_repeat(rank, r, c, K_SHARD, nranks);
                 const float diff = std::fabs(got - ref);
                 if (diff > 0.1f) {
@@ -458,8 +504,8 @@ int main(int argc, char** argv) {
     MPI_Reduce(&mism, &total_mism, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     if (rank == 0) {
         const double flops = 2.0 * double(M) * double(N) * double(K);
-        printf("a2a_gemm_lsa M=%d N=%d K=%d ranks=%d mode=%d persistent=%d comm_wgs=%d compute_wgs=%d grid_wgs=%d max_rank_time=%.4f ms %.2f TFLOP/s %s\n",
-               M, N, K, nranks, mode, persistent, comm_wgs,
+        printf("a2a_gemm_lsa M=%d N=%d K=%d ranks=%d mode=%d input_mode=%s persistent=%d comm_wgs=%d compute_wgs=%d grid_wgs=%d max_rank_time=%.4f ms %.2f TFLOP/s %s\n",
+               M, N, K, nranks, mode, input_mode_name, persistent, comm_wgs,
                persistent ? compute_wgs : compute_tasks, grid_wgs,
                max_ms, flops / (max_ms * 1.0e9),
                (!validate || total_mism == 0) ? "SUCCESS" : "FAILED");
