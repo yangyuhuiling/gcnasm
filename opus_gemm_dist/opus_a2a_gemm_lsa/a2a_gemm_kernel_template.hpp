@@ -203,10 +203,20 @@ __device__ inline void wait_input_ready(opus_a2a_gemm_kargs kargs, int k_part, i
 
 }  // namespace a2a_gemm_lsa
 
+template<typename UserTraits>
+__global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
+void a2a_lsa_comm_kernel(opus_a2a_gemm_kargs kargs) {
+    using T = gemm_quad_subtile::kernel_traits<opus::remove_cvref_t<UserTraits>>;
+    const int comm_slot = opus::block_id_x();
+    if (comm_slot < kargs.comm_wgs) {
+        a2a_gemm_lsa::copy_local_a_to_peer<T>(kargs, comm_slot, kargs.comm_wgs);
+    }
+}
+
 template<typename UserTraits, int Mode, bool Persistent = false>
 __global__ __launch_bounds__(UserTraits::BLOCK_SIZE, 2)
 void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs) {
-    static_assert(Mode == 0 || Mode == 1);
+    static_assert(Mode == 0 || Mode == 1 || Mode == 2);
     static_assert(!Persistent || Mode == 0, "persistent scheduling is only enabled for fused mode");
     using namespace opus;
     using namespace gemm_quad_subtile;
@@ -307,14 +317,14 @@ void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs) {
     int k_base = 0;
 
     const D_A* a_base = nullptr;
-    if constexpr (Mode == 0) {
+    if constexpr (Mode != 1) {
         a_base = reinterpret_cast<const D_A*>(kargs.recv_a_local);
     } else {
         a_base = reinterpret_cast<const D_A*>(kargs.local_a);
     }
 
     unsigned int a_bytes = 0;
-    if constexpr (Mode == 0) {
+    if constexpr (Mode != 1) {
         a_bytes = kargs.recv_a_bytes - static_cast<unsigned int>(row * kargs.stride_a * sizeof(D_A));
     } else {
         a_bytes = static_cast<unsigned int>((kargs.m - row) * kargs.stride_a * sizeof(D_A));
@@ -372,15 +382,15 @@ void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs) {
     auto a_offset = [&](int half_tile_m, int tile_k) {
         const int shard_tile_k = tile_k & (kFullLocalShardTiles - 1);
 #if A2A_GEMM_READY_AWARE_K
-        const int part = Mode == 0 ? active_part : 0;
+        const int part = Mode != 1 ? active_part : 0;
 #else
-        const int part = Mode == 0 ? ordered_part(tile_k) : 0;
+        const int part = Mode != 1 ? ordered_part(tile_k) : 0;
 #endif
         return part * kargs.m * kargs.k_shard +
                half_tile_m * T::HALF_B_M * kargs.stride_a + shard_tile_k * T::B_K;
     };
     auto b_offset = [&](int half_tile_n, int tile_k) {
-        if constexpr (Mode == 0) {
+        if constexpr (Mode != 1) {
             const int shard_tile_k = tile_k & (kFullLocalShardTiles - 1);
             return half_tile_n * T::HALF_B_N * kargs.stride_b +
 #if A2A_GEMM_READY_AWARE_K
@@ -393,23 +403,23 @@ void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs) {
     };
 
     constexpr int kFullLocalLoops = 8192 / T::B_K;
-    const int shard_outer_loops = Mode == 0 ? kargs.rank_count : 1;
-    const int shard_loops = Mode == 0 ? kFullLocalShardTiles : kFullLocalLoops;
+    const int shard_outer_loops = Mode != 1 ? kargs.rank_count : 1;
+    const int shard_loops = Mode != 1 ? kFullLocalShardTiles : kFullLocalLoops;
     int tic = 0, toc = 1;
 
     for (int shard_iter = 0; shard_iter < shard_outer_loops; ++shard_iter) {
 #if A2A_GEMM_READY_AWARE_K
     const int shard_base_tile = 0;
 #else
-    const int shard_base_tile = Mode == 0 ? shard_iter * kFullLocalShardTiles : 0;
+    const int shard_base_tile = Mode != 1 ? shard_iter * kFullLocalShardTiles : 0;
 #endif
-    if constexpr (Mode == 0) {
+    if constexpr (Mode != 1) {
         if (shard_iter != 0) {
             s_waitcnt_vmcnt(0_I);
             if (wave_id_m == 1) __builtin_amdgcn_s_barrier();
         }
     }
-    if constexpr (Mode == 0) {
+    if constexpr (Mode != 1) {
 #if A2A_GEMM_READY_AWARE_K
         if (shard_iter != 0) {
             if (tid == 0) {
@@ -441,7 +451,9 @@ void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs) {
 #else
         const int part = ordered_part(shard_base_tile);
 #endif
-        wait_input_ready<T>(kargs, part, m_tile, tid, wave_id);
+        if constexpr (Mode == 0) {
+            wait_input_ready<T>(kargs, part, m_tile, tid, wave_id);
+        }
     }
 
     async_load<T::VEC_B>(g_b, B_TILE(tic, 0).ptr, u_gb, u_sb, b_offset(0, shard_base_tile + 0));
@@ -612,7 +624,7 @@ void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs) {
         __builtin_amdgcn_s_setprio(0);
         __builtin_amdgcn_s_barrier();
     }
-    if constexpr (Mode == 0) {
+    if constexpr (Mode != 1) {
         if (shard_iter + 1 < shard_outer_loops) {
             s_waitcnt_vmcnt(0_I);
             if (wave_id_m == 0) __builtin_amdgcn_s_barrier();

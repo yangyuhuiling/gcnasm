@@ -68,6 +68,8 @@ extern "C" ncclResult_t ncclRecv(void* recvbuff, size_t count, int datatype, int
 template<typename Traits, int Mode, bool Persistent>
 __global__ void a2a_gemm_lsa_kernel(opus_a2a_gemm_kargs kargs);
 template<typename Traits>
+__global__ void a2a_lsa_comm_kernel(opus_a2a_gemm_kargs kargs);
+template<typename Traits>
 __global__ void gemm_a16w16_quad_subtile_kernel(opus_gemm_kargs kargs);
 
 __global__ void pack_a_shards_kernel(const bf16_t* __restrict__ recv,
@@ -206,8 +208,8 @@ int main(int argc, char** argv) {
         if (rank == 0) fprintf(stderr, "unsupported comm config: comm_wgs must be positive\n");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
-    if (mode != 0 && mode != 1 && mode != 2) {
-        if (rank == 0) fprintf(stderr, "unsupported mode: only 0=fused, 1=compute-only, 2=RCCL-A2A+GEMM are enabled\n");
+    if (mode < 0 || mode > 3) {
+        if (rank == 0) fprintf(stderr, "unsupported mode: 0=fused, 1=compute-only, 2=RCCL baseline, 3=split LSA\n");
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
     if ((persistent != 0 && persistent != 1) || (persistent && mode != 0)) {
@@ -413,37 +415,83 @@ int main(int argc, char** argv) {
             }
         } else if (mode == 1) {
             a2a_gemm_lsa_kernel<Traits, 1, false><<<grid, block>>>(kargs);
-        } else {
+        } else if (mode == 2) {
             launch_nonfused_once();
         }
         CHECK_HIP(hipGetLastError());
     };
 
-    for (int i = 0; i < warmup; ++i) {
-        clear_for_launch();
-        launch_once();
-        CHECK_HIP(hipDeviceSynchronize());
-        CHECK_CCO(ccoBarrierAll(comm));
-    }
+    auto launch_split_comm = [&]() {
+        a2a_lsa_comm_kernel<Traits><<<dim3(comm_wgs), block>>>(kargs);
+        CHECK_HIP(hipGetLastError());
+    };
+    auto launch_split_compute = [&]() {
+        a2a_gemm_lsa_kernel<Traits, 2, false><<<gemm_grid, block>>>(kargs);
+        CHECK_HIP(hipGetLastError());
+    };
 
-    hipEvent_t start, stop;
+    hipEvent_t start, comm_stop, compute_start, stop;
     CHECK_HIP(hipEventCreate(&start));
+    CHECK_HIP(hipEventCreate(&comm_stop));
+    CHECK_HIP(hipEventCreate(&compute_start));
     CHECK_HIP(hipEventCreate(&stop));
-    float total_ms = 0.0f;
-    for (int i = 0; i < iters; ++i) {
-        clear_for_launch();
-        CHECK_HIP(hipEventRecord(start));
-        launch_once();
-        CHECK_HIP(hipEventRecord(stop));
-        CHECK_HIP(hipEventSynchronize(stop));
-        float ms = 0.0f;
-        CHECK_HIP(hipEventElapsedTime(&ms, start, stop));
-        total_ms += ms;
-        CHECK_CCO(ccoBarrierAll(comm));
+    float total_ms = 0.0f, comm_total_ms = 0.0f, compute_total_ms = 0.0f;
+    if (mode == 3) {
+        for (int i = 0; i < warmup; ++i) {
+            clear_for_launch();
+            launch_split_comm();
+            CHECK_HIP(hipDeviceSynchronize());
+            CHECK_CCO(ccoBarrierAll(comm));
+            launch_split_compute();
+            CHECK_HIP(hipDeviceSynchronize());
+            CHECK_CCO(ccoBarrierAll(comm));
+        }
+        for (int i = 0; i < iters; ++i) {
+            clear_for_launch();
+            CHECK_HIP(hipEventRecord(start));
+            launch_split_comm();
+            CHECK_HIP(hipEventRecord(comm_stop));
+            CHECK_HIP(hipEventSynchronize(comm_stop));
+            CHECK_CCO(ccoBarrierAll(comm));
+            CHECK_HIP(hipEventRecord(compute_start));
+            launch_split_compute();
+            CHECK_HIP(hipEventRecord(stop));
+            CHECK_HIP(hipEventSynchronize(stop));
+            float comm_ms = 0.0f, compute_ms = 0.0f, split_ms = 0.0f;
+            CHECK_HIP(hipEventElapsedTime(&comm_ms, start, comm_stop));
+            CHECK_HIP(hipEventElapsedTime(&compute_ms, compute_start, stop));
+            CHECK_HIP(hipEventElapsedTime(&split_ms, start, stop));
+            comm_total_ms += comm_ms;
+            compute_total_ms += compute_ms;
+            total_ms += split_ms;
+            CHECK_CCO(ccoBarrierAll(comm));
+        }
+    } else {
+        for (int i = 0; i < warmup; ++i) {
+            clear_for_launch();
+            launch_once();
+            CHECK_HIP(hipDeviceSynchronize());
+            CHECK_CCO(ccoBarrierAll(comm));
+        }
+        for (int i = 0; i < iters; ++i) {
+            clear_for_launch();
+            CHECK_HIP(hipEventRecord(start));
+            launch_once();
+            CHECK_HIP(hipEventRecord(stop));
+            CHECK_HIP(hipEventSynchronize(stop));
+            float ms = 0.0f;
+            CHECK_HIP(hipEventElapsedTime(&ms, start, stop));
+            total_ms += ms;
+            CHECK_CCO(ccoBarrierAll(comm));
+        }
     }
     const double local_ms = static_cast<double>(total_ms) / iters;
-    double max_ms = 0.0;
+    const double local_comm_ms = static_cast<double>(comm_total_ms) / iters;
+    const double local_compute_ms = static_cast<double>(compute_total_ms) / iters;
+    double max_ms = 0.0, max_comm_ms = 0.0, max_compute_ms = 0.0;
     MPI_Reduce(&local_ms, &max_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_comm_ms, &max_comm_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
+    MPI_Reduce(&local_compute_ms, &max_compute_ms, 1, MPI_DOUBLE, MPI_MAX, 0, MPI_COMM_WORLD);
 
     if (rank == 0 && record_wg_hw) {
         auto h_hw_records = std::make_unique<unsigned int[]>(hw_record_elems);
@@ -504,14 +552,24 @@ int main(int argc, char** argv) {
     MPI_Reduce(&mism, &total_mism, 1, MPI_INT, MPI_SUM, 0, MPI_COMM_WORLD);
     if (rank == 0) {
         const double flops = 2.0 * double(M) * double(N) * double(K);
-        printf("a2a_gemm_lsa M=%d N=%d K=%d ranks=%d mode=%d input_mode=%s persistent=%d comm_wgs=%d compute_wgs=%d grid_wgs=%d max_rank_time=%.4f ms %.2f TFLOP/s %s\n",
-               M, N, K, nranks, mode, input_mode_name, persistent, comm_wgs,
-               persistent ? compute_wgs : compute_tasks, grid_wgs,
-               max_ms, flops / (max_ms * 1.0e9),
-               (!validate || total_mism == 0) ? "SUCCESS" : "FAILED");
+        if (mode == 3) {
+            printf("a2a_gemm_split M=%d N=%d K=%d ranks=%d input_mode=%s comm_wgs=%d comm_ms=%.4f compute_ms=%.4f comm_plus_compute=%.4f split_total_ms=%.4f %.2f TFLOP/s %s\n",
+                   M, N, K, nranks, input_mode_name, comm_wgs,
+                   max_comm_ms, max_compute_ms, max_comm_ms + max_compute_ms, max_ms,
+                   flops / (max_ms * 1.0e9),
+                   (!validate || total_mism == 0) ? "SUCCESS" : "FAILED");
+        } else {
+            printf("a2a_gemm_lsa M=%d N=%d K=%d ranks=%d mode=%d input_mode=%s persistent=%d comm_wgs=%d compute_wgs=%d grid_wgs=%d max_rank_time=%.4f ms %.2f TFLOP/s %s\n",
+                   M, N, K, nranks, mode, input_mode_name, persistent, comm_wgs,
+                   persistent ? compute_wgs : compute_tasks, grid_wgs,
+                   max_ms, flops / (max_ms * 1.0e9),
+                   (!validate || total_mism == 0) ? "SUCCESS" : "FAILED");
+        }
     }
 
     CHECK_HIP(hipEventDestroy(start));
+    CHECK_HIP(hipEventDestroy(comm_stop));
+    CHECK_HIP(hipEventDestroy(compute_start));
     CHECK_HIP(hipEventDestroy(stop));
     CHECK_CCO(ccoWindowDeregister(comm, recv_win));
     CHECK_CCO(ccoWindowDeregister(comm, ready_win));

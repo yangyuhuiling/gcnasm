@@ -217,3 +217,26 @@ The fused kernel is faster on every tested shape, with a 1.07x to 1.40x
 speedup over the in-project non-fused baseline. RCCL communicator creation is
 performed after CCO window registration; the reverse order caused ROCr VMM
 handle conflicts for the larger receive windows.
+
+## Split LSA communication and compute timing
+
+Mode 3 splits the fused path into an LSA comm-only kernel followed by a
+compute-from-recv kernel, with an explicit device synchronization and CCO
+barrier between them:
+
+```bash
+./build/a2a_gemm_lsa.exe --mode 3 --input-mode generic_a2a
+```
+
+With 8 ranks, `N=K=8192`, `--warmup 10 --iters 30`:
+
+- `M=2048`: comm 0.1352 ms, compute 0.1981 ms, split total 0.4253 ms, fused 0.3267 ms.
+- `M=6144`: comm 0.3473 ms, compute 0.5567 ms, split total 1.0060 ms, fused 0.8845 ms.
+- `M=16384`: comm 0.8510 ms, compute 1.4882 ms, split total 2.4274 ms, fused 2.3144 ms.
+
+Fused reduces split latency by 23.2%, 12.1%, and 4.7% respectively. The
+`comm_ms + compute_ms - fused_ms` overlap upper bound is only 0.0066, 0.0195,
+and 0.0248 ms (about 1% to 2% of the serial device work). Most of the measured
+fused advantage comes from removing the extra kernel transition, device
+synchronization, and cross-rank host barrier. This fixed overhead matters most
+for the smaller M shape, while its fraction decreases as GEMM work grows.

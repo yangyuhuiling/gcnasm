@@ -15,6 +15,13 @@ STORE_STAGGER_DELAY  ?= 4
 TILE_ORDER       ?= 1
 # 1=global-counter persistent CTAs, 0=one output tile per CTA.
 PERSISTENT       ?= 1
+# TRACE=1 keeps -O3 but adds DWARF and maps relative source paths to this
+# absolute directory so the ATT viewer can load source text.
+TRACE            ?= 0
+ifeq ($(TRACE),1)
+TRACE_FLAGS      := -g -fdebug-compilation-dir=/ \
+	-ffile-prefix-map=.=$(CURDIR) -fdebug-prefix-map=.=$(CURDIR)
+endif
 
 MPI_INCLUDE_DIR ?= /usr/lib/x86_64-linux-gnu/openmpi/include
 MPI_LIB         ?= -lmpi_cxx -lmpi
@@ -22,7 +29,7 @@ MPI_LIB         ?= -lmpi_cxx -lmpi
 BUILD = build
 OUT   = $(BUILD)/quad_lsa_direct.exe
 
-COMMON_FLAGS = -I. -I$(OPUS_INCLUDE_DIR) -std=c++20 -fopenmp -O3 -Wall --offload-arch=$(ARCH) -ffast-math -DOPUS_STORE_PIPELINE=$(STORE_PIPELINE) -DOPUS_C_STORE_MODE=$(C_STORE_MODE) -DOPUS_STORE_STAGGER_PHASES=$(STORE_STAGGER_PHASES) -DOPUS_STORE_STAGGER_DELAY=$(STORE_STAGGER_DELAY) -DOPUS_TILE_ORDER=$(TILE_ORDER) -DOPUS_PERSISTENT=$(PERSISTENT)
+COMMON_FLAGS = -I. -I$(abspath $(OPUS_INCLUDE_DIR)) -std=c++20 -fopenmp -O3 $(TRACE_FLAGS) -Wall --offload-arch=$(ARCH) -ffast-math -DOPUS_STORE_PIPELINE=$(STORE_PIPELINE) -DOPUS_C_STORE_MODE=$(C_STORE_MODE) -DOPUS_STORE_STAGGER_PHASES=$(STORE_STAGGER_PHASES) -DOPUS_STORE_STAGGER_DELAY=$(STORE_STAGGER_DELAY) -DOPUS_TILE_ORDER=$(TILE_ORDER) -DOPUS_PERSISTENT=$(PERSISTENT)
 HOST_INCLUDES = -I$(MORI_INCLUDE_DIR) -I$(MPI_INCLUDE_DIR)
 HOST_LIBS = -L$(MORI_LIB_DIR) -lmori_cco -Wl,-rpath,$(MORI_LIB_DIR) $(MPI_LIB)
 
